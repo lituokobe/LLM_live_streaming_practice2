@@ -12,9 +12,16 @@ from torch.utils.data import DataLoader, DistributedSampler
 from contextlib import nullcontext
 from transformers import AutoTokenizer
 from model import MyModelConfig, MyModelForCausalLM
-from dataset import PretrainDataset
+from dataset import SFTDataset
 
 warnings.filterwarnings("ignore")
+
+"""
+Full SFT will retrain all the parameters of the model, including the experts in MoE layers.
+So the code is very similar to pretrain.py.
+
+We adapt the model trained on general text to a Q&A chatbot which is fine-tuned with Q&A data.
+"""
 
 def Logger(content):
     # if not distributed training, print on the single machine
@@ -32,12 +39,21 @@ def get_lr(current_step, total_steps, lr):
     """
     return lr/10 + 0.5*lr*(1+math.cos(math.pi*current_step/total_steps))
 
+# thef function of init_model is the only part changed from pretrain.py
 def init_model(lm_config):
     # read a readily available tokenizer from huggingface
     tokenizer = AutoTokenizer.from_pretrained('./model')
     # use our own class to initialize a model
-    model = MyModelForCausalLM(lm_config).to(args.device)
+    model = MyModelForCausalLM(lm_config) # at this time, the parameters are randomly initialized
+    
+    # load the pretrained model parameters
+    moe_path = "_moe" if lm_config.use_moe else ""
+    ckp = f"./pretrained_model/pretrain_{lm_config.hidden_size}{moe_path}.pth"
+    state_dict = torch.load(ckp, map_location=args.device)
+    model.load_state_dict(state_dict, strict=False) # load the pretrained model parameters, strict=False means we can load part of the parameters
     Logger(f"Trainable parameters in the model: {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.2f} millions.")
+    model = model.to(args.device)
+    
     return model, tokenizer
 
 def init_distributed_model(args):
@@ -52,6 +68,7 @@ def init_distributed_model(args):
     # make the code run on the local device, meaning a specific GPU (local rank) on a specific machine (global rank)
     DEVICE = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(DEVICE)
+
 def train_epoch(epoch):
     loss_fct = nn.CrossEntropyLoss(reduction="none")
     # reduction="none" means we don't want to sum the loss, we want the loss of each sample, because we need to apply loss mask
@@ -113,7 +130,7 @@ def train_epoch(epoch):
             # only save the model in the only machine or the main machine
             model.eval()
             moe_path = "_moe" if lm_config.use_moe else ""
-            ckp = f"{args.save_dir}/pretrain_{lm_config.hidden_size}{moe_path}.pth"
+            ckp = f"{args.save_dir}/full_sft_{lm_config.hidden_size}{moe_path}.pth"
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 # if parallel training, we need to get the state dict of the model
                 state_dict = model.module.state_dict()
@@ -145,7 +162,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_seq_len", type=int, default=512)
     # parser.add_argument("--use_moe", type=bool, default=False)
     parser.add_argument("--use_moe", type=bool, default=True)
-    parser.add_argument("--data_path", type=str, default="./data/pretrain_hq.jsonl")
+    parser.add_argument("--data_path", type=str, default="./data/sft_mini_512.jsonl")
     args = parser.parse_args()
     lm_config = MyModelConfig(
         hidden_size = args.hidden_size,
@@ -183,7 +200,10 @@ if __name__ == "__main__":
 
     # Initialize the model
     model, tokenizer = init_model(lm_config)
-    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    # We also changed the dataset class to fit the SFT data structure
+    # In this example, the SFT data is a collection of jsons that inclue Q and A
+    # The original pretraining data is a only collection of texts
+    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len) 
     train_sampler = DistributedSampler(train_ds) if ddp else None
     # Read the sample one by one, return the data batch by batch
     train_loader = DataLoader(
@@ -197,8 +217,8 @@ if __name__ == "__main__":
     )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ["float16","bfloat16"]))
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-    
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)  
+
     if ddp:
         model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
         model = DistributedDataParallel(model, device_ids=[ddp_local_rank])

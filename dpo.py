@@ -7,12 +7,13 @@ import torch
 import warnings
 import torch.distributed as dist # for distribution calculation
 from torch import optim, nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from contextlib import nullcontext
 from transformers import AutoTokenizer
 from model import MyModelConfig, MyModelForCausalLM
-from dataset import PretrainDataset
+from dataset import DPODataset
 
 warnings.filterwarnings("ignore")
 
@@ -32,12 +33,62 @@ def get_lr(current_step, total_steps, lr):
     """
     return lr/10 + 0.5*lr*(1+math.cos(math.pi*current_step/total_steps))
 
+def logits_to_probs(logits, labels):
+    # Convert the log probability generated from the model to probability distribution
+    # logits shape : (batch_size, seq_len, vocab_size)
+    # labels shape: (batch_size, seq_len)
+    # probs shape: (batch_size, seq_len)
+    log_probs = F.log_softmax(logits, dim=2) # softmax first, then log
+    # get the probabilities from the correct label
+    probs = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
+    return probs
+
+def dpo_loss(ref_probs, probs, mask, beta):
+    # ref_probs: probabilities from reference model's deduction
+    # probs: probabilities from the model that needs DPO training
+    # mask: question+answer that is relevant to loss calculation - aka answer
+    # beta: hyperparameter in DPO loss function
+    # ref_probs and probs have the same shape (batch_size, seq_len)
+    seq_lengths = mask.sum(dim=1, keepdim=True) # (batch_size, 1)
+    ref_probs = (ref_probs*mask).sum(dim = 1)/seq_lengths.squeeze()
+    probs = (probs*mask).sum(dim = 1)/seq_lengths.squeeze()
+
+    # split chosen and rejected
+    batch_size = ref_probs.shape[0]
+    chose_ref_probs = ref_probs[:batch_size // 2]
+    rejected_ref_probs = ref_probs[batch_size // 2:]
+    chose_probs = probs[:batch_size // 2]
+    rejected_probs = probs[batch_size // 2:]
+
+    pi_logratios = chose_probs - rejected_probs
+    ref_logratios = chose_ref_probs - rejected_ref_probs
+    logits = pi_logratios - ref_logratios
+
+    loss = -F.logsigmoid(beta*logits)
+    return loss.mean()
+
+# the function of init_model is the only part changed from pretrain.py
 def init_model(lm_config):
     # read a readily available tokenizer from huggingface
     tokenizer = AutoTokenizer.from_pretrained('./model')
     # use our own class to initialize a model
-    model = MyModelForCausalLM(lm_config).to(args.device)
+    model = MyModelForCausalLM(lm_config) # at this time, the parameters are randomly initialized
+    
+    # load the pretrained model parameters
+    moe_path = "_moe" if lm_config.use_moe else ""
+    ckp = f"./pretrained_model/full_sft_{lm_config.hidden_size}{moe_path}.pth"
+    state_dict = torch.load(ckp, map_location=args.device)
+    model.load_state_dict(state_dict, strict=False) # load the pretrained model parameters, strict=False means we can load part of the parameters
     Logger(f"Trainable parameters in the model: {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.2f} millions.")
+    model = model.to(args.device)
+
+    # initialize the reference model
+    ref_model = MyModelForCausalLM(lm_config)
+    ref_model.load_state_dict(state_dict, strict=False)
+    ref_model.eval()
+    ref_model.requires_grad_(False)
+    ref_model.to(args.device)
+
     return model, tokenizer
 
 def init_distributed_model(args):
@@ -52,14 +103,19 @@ def init_distributed_model(args):
     # make the code run on the local device, meaning a specific GPU (local rank) on a specific machine (global rank)
     DEVICE = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(DEVICE)
+
 def train_epoch(epoch):
-    loss_fct = nn.CrossEntropyLoss(reduction="none")
-    # reduction="none" means we don't want to sum the loss, we want the loss of each sample, because we need to apply loss mask
     start_time = time.time()
-    for step, (X, Y, loss_mask) in enumerate(train_loader):
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
+    for step, batch in enumerate(train_loader):
+        x_chosen = batch["x_chosen"].to(args.device)
+        y_chosen = batch["y_chosen"].to(args.device)
+        mask_chosen = batch["mask_chosen"].to(args.device)
+        x_rejected = batch["x_rejected"].to(args.device)
+        y_rejected = batch["y_rejected"].to(args.device)
+        mask_rejected = batch["mask_rejected"].to(args.device)
+        x = torch.cat([x_chosen, x_rejected], dim=0) # stack the sample to have only one x
+        y = torch.cat([y_chosen, y_rejected], dim=0)
+        mask = torch.cat([mask_chosen, mask_rejected], dim=0)
 
         lr = get_lr(epoch*iter_per_epoch + step, args.epochs*iter_per_epoch, args.learning_rate)
 
@@ -68,10 +124,19 @@ def train_epoch(epoch):
             param_group["lr"] = lr
         # ctx, either based on CPU or GPU, for mixed precision
         with ctx:
-            res = model(X) # forward pass for prediction results
-            loss = loss_fct(res.logits.view(-1, res.logits.size(-1)), Y.view(-1)).view(Y.size())
-            loss = (loss * loss_mask).sum() / loss_mask.sum() # only keep the loss of the samples that are not padding, get average loss per token
-            loss += res.aux_loss # Add moe's auxiliary loss
+            with torch.no_grad(): # ref_model won't be trained
+                ref_outputs = ref_model(x)
+                ref_logits = ref_outputs.logits
+            ref_probs = logits_to_probs(ref_logits, y)
+            ref_probs = ref_probs * mask
+
+            # forward propagation
+            outputs = model(x)
+            logits = outputs.logits
+            probs = logits_to_probs(logits, y)
+            probs = probs * mask
+
+            loss = dpo_loss(ref_probs, probs, mask, beta=0.1)
             loss = loss/args.accumulation_steps # accumulation of gradient, this is an optimization technique
             """
             loss = loss / args.accumulation_steps ensures that when you're accumulating gradients over multiple mini-batches,
@@ -113,7 +178,7 @@ def train_epoch(epoch):
             # only save the model in the only machine or the main machine
             model.eval()
             moe_path = "_moe" if lm_config.use_moe else ""
-            ckp = f"{args.save_dir}/pretrain_{lm_config.hidden_size}{moe_path}.pth"
+            ckp = f"{args.save_dir}/dpo_{lm_config.hidden_size}{moe_path}.pth"
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 # if parallel training, we need to get the state dict of the model
                 state_dict = model.module.state_dict()
@@ -145,7 +210,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_seq_len", type=int, default=512)
     # parser.add_argument("--use_moe", type=bool, default=False)
     parser.add_argument("--use_moe", type=bool, default=True)
-    parser.add_argument("--data_path", type=str, default="./data/pretrain_hq.jsonl")
+    parser.add_argument("--data_path", type=str, default="./data/sft_mini_512.jsonl")
     args = parser.parse_args()
     lm_config = MyModelConfig(
         hidden_size = args.hidden_size,
@@ -183,7 +248,10 @@ if __name__ == "__main__":
 
     # Initialize the model
     model, tokenizer = init_model(lm_config)
-    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    # We also changed the dataset class to fit the SFT data structure
+    # In this example, the SFT data is a collection of jsons that inclue Q and A
+    # The original pretraining data is a only collection of texts
+    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len) 
     train_sampler = DistributedSampler(train_ds) if ddp else None
     # Read the sample one by one, return the data batch by batch
     train_loader = DataLoader(
@@ -197,8 +265,8 @@ if __name__ == "__main__":
     )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ["float16","bfloat16"]))
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-    
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)  
+
     if ddp:
         model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
         model = DistributedDataParallel(model, device_ids=[ddp_local_rank])

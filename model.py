@@ -38,7 +38,7 @@ class MyModelConfig(PretrainedConfig):
             seq_aux: bool = True,
             norm_topk_prob: bool = True,
             **kwargs
-     )
+            ):
         super().__init__(**kwargs)
         self.dropout = dropout
         self.bos_token_id = bos_token_id
@@ -164,7 +164,7 @@ class Attention(nn.Module):
         scaled_scores = (xq@xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
         # scores + mask
         masked_scores = scaled_scores + torch.triu(
-            torch.full((seq_len, seq_len), float('-inf'), device=scores.device)
+            torch.full((seq_len, seq_len), float('-inf'), device=scaled_scores.device), diagonal=1
         ) # masked (make it to infinite negative) to all values above the diagonal
         masked_scores = masked_scores.unsqueeze(0).unsqueeze(0)
         if attention_mask is not None:
@@ -185,8 +185,8 @@ class Attention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, config):
         super().__init__()
-        if config.intermidiate_size is None:
-            intermediate_size = int(config.hidden_zie*8/3)
+        if config.intermediate_size is None:
+            intermediate_size = int(config.hidden_size*8/3)
             config.intermediate_size = 64*((intermediate_size+64-1)//64)
 
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
@@ -218,9 +218,9 @@ class MoEGate(nn.Module):
         # Initialize the gate matrix
         self.reset_parameters()
 
-    def register_parameter(self):
+    def reset_parameters(self):
         import torch.nn.init as init
-        init.kaiming_uniform(self.weight, a = math.sqrt(5))
+        init.kaiming_uniform_(self.weight, a = math.sqrt(5))
 
     def forward(self, hidden_states):
         # This is the core logic, input is a hidden state, output is result of expert allocation and auxiliary loss
@@ -243,10 +243,10 @@ class MoEGate(nn.Module):
             topk_weight = topk_weight / denominator
 
         # if in training mode and auxiliary loss is activated, we need to calculate the auxiliary loss
-        if self.training and self.alpha > 0:
+        if self.training and self.alpha > 0.0:
             scores_for_aux = scores # scores of all experts before topk selection
             aux_topk = self.top_k
-            topk_idx_for_aux_loss = topk_idex.view(bsz, -1) # Flattened topk expert index
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1) # Flattened topk expert index
             if self.seq_aux:
                 # calculate auxiliary loss for sequence level
                 # view a sequence as a whole, is the whole sequence only use one expert, then punish the sequence to encourage to use multiple experts
@@ -255,9 +255,9 @@ class MoEGate(nn.Module):
                 ce = torch.zeros((bsz, self.n_routed_experts), device = hidden_states.device)
                 # count the frequency of each expert
                 ce.scatter_add_(1, topk_idx_for_aux_loss,
-                                torch.ones(bsz, seq_len*aux_topk)).div_(seq_len*aux_topk/self.n_routed_experts)
+                                torch.ones(bsz, seq_len*aux_topk, device=hidden_states.device)).div_(seq_len*aux_topk/self.n_routed_experts)
                 # multiply the average as the loss
-                aux_loss = (ce*scores_for_seq_aux.mean(dim = 1)).sum().mean()*self.alpha
+                aux_loss = (ce*scores_for_seq_aux.mean(dim = 1)).sum(dim = 1).mean()*self.alpha
             else:
                 # calculate auxiliary loss for token level
                 # To see what expert is chosen by each token, punish the token to encourage it to choose multiple experts
@@ -269,6 +269,8 @@ class MoEGate(nn.Module):
                 fi = ce*self.n_routed_experts
                 # calculate the multiplied result as loss
                 aux_loss = (Pi*fi).sum()*self.alpha
+        else:
+            aux_loss = 0
 
         return topk_idx, topk_weight, aux_loss
 
@@ -306,7 +308,7 @@ class MoEFeedForward(nn.Module):
                 y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)
             # reshape the output
             # use token_weight to have a weighted output of all the experts' results
-            y = (y.view(*topk_weight.shape, -1)*topk_weight.unsqueeze(-1).sum(dim = 1))
+            y = (y.view(*topk_weight.shape, -1)*topk_weight.unsqueeze(-1)).sum(dim = 1)
             # restore the output shape
             y = y.view(*orig_shape)
         else:
@@ -368,14 +370,14 @@ class MyModelBlock(nn.Module):
         self.head_dim = self.hidden_size // self.num_attention_heads
         self.self_attn = Attention(config)
         self.layer_id = layer_id
-        self.input.layernorm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
         self.mlp = FeedForward(config) if not config.use_moe else MoEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_values = None,
                 use_cache = False, attention_mask = None):
         residual = hidden_states
-        hidden_states, present_key_value = self.self_attn(self.input.layernorm(hidden_states), position_embeddings,
+        hidden_states, present_key_value = self.self_attn(self.input_layernorm(hidden_states), position_embeddings,
                                                           past_key_values, use_cache, attention_mask)
 
         hidden_states += residual
@@ -434,7 +436,7 @@ class MyModel(nn.Module):
 
         aux_loss = sum(
             # layer.mlp takes the mlp out from block, it could be MoEFeedForward or FeedForward
-            layer.mpl.aux_loss for layer in self.layers
+            layer.mlp.aux_loss for layer in self.layers
             if isinstance(layer.mlp, MoEFeedForward)
         )
 
@@ -450,8 +452,12 @@ class MyModelForCausalLM(PreTrainedModel, GenerationMixin):
         self.model = MyModel(self.config)
         # This is output layer
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias = False)
+
         # use shared weight for tensors with same (transposed) dimension, this reduce the parameter amount
+        # but this will cause the model cannot be converted to safetensors format
         self.model.embd_tokens.weight = self.lm_head.weight
+        # self.model.embd_tokens.weight = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias = False)
+
         self.OUT = CausalLMOutputWithPast()
 
     def forward(self,
@@ -459,8 +465,8 @@ class MyModelForCausalLM(PreTrainedModel, GenerationMixin):
                 attention_mask: Optional[torch.Tensor] = None,
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 user_cache: bool = False,
-                logits_to_keep: Union[int, torch.Tensor] = None,
-                **kwargs):
+                logits_to_keep: Union[int, torch.Tensor] = 0,
+                **args):
         # h is the output of stacked blocks
         h, past_kvs, aux_loss = self.model(
             input_ids = input_ids,
